@@ -5,10 +5,11 @@ from __future__ import annotations
 
 import os
 import re
-import shlex
-import subprocess
+import socket
+from concurrent.futures import ThreadPoolExecutor
 from typing import Any
 
+import paramiko
 from mcp.server.fastmcp import FastMCP
 
 SERVER_NAME = "ssh-mcp"
@@ -17,6 +18,7 @@ USER_PATTERN = re.compile(r"^[A-Za-z0-9._-]+$")
 
 DEFAULT_HOST = os.getenv("SSH_DEFAULT_HOST", "").strip()
 DEFAULT_USER = os.getenv("SSH_DEFAULT_USER", "").strip()
+DEFAULT_PASSWORD = os.getenv("SSH_DEFAULT_PASSWORD", "").strip()
 DEFAULT_PORT = int(os.getenv("SSH_DEFAULT_PORT", "22"))
 DEFAULT_TIMEOUT_SEC = int(os.getenv("SSH_DEFAULT_TIMEOUT_SEC", "60"))
 CONNECT_TIMEOUT_SEC = int(os.getenv("SSH_CONNECT_TIMEOUT_SEC", "10"))
@@ -55,17 +57,25 @@ def ssh_exec(
     command: str,
     host: str = "",
     user: str = "",
-    port: int = 22,
+    password: str = "",
+    port: int = 0,
     identity_file: str = "",
-    timeout_sec: int = 60,
+    timeout_sec: int = 0,
     strict_host_key_checking: bool = True,
 ) -> dict[str, Any]:
-    """Run one shell command on a remote machine via SSH and return stdout/stderr/exit code."""
+    """Run one shell command on a remote machine via SSH and return stdout/stderr/exit code.
+
+    Authentication (in order of precedence):
+    - 'password': use password-based auth (disables key lookup).
+    - 'identity_file': use a specific private key file.
+    - Neither provided: try keys from ~/.ssh and the SSH agent automatically.
+    """
     if not command.strip():
         raise ValueError("command must not be empty")
 
     target_host = host.strip() or DEFAULT_HOST
     target_user = user.strip() or DEFAULT_USER
+    target_password = password.strip() or DEFAULT_PASSWORD
     target_port = port or DEFAULT_PORT
     target_timeout = timeout_sec or DEFAULT_TIMEOUT_SEC
 
@@ -81,66 +91,123 @@ def ssh_exec(
         _validate_user(target_user)
 
     target = f"{target_user}@{target_host}" if target_user else target_host
-    ssh_cmd = [
-        "ssh",
-        "-p",
-        str(target_port),
-        "-o",
-        "BatchMode=yes",
-        "-o",
-        f"ConnectTimeout={CONNECT_TIMEOUT_SEC}",
-    ]
+
+    client = paramiko.SSHClient()
+
+    # Load known hosts for host key verification.
+    client.load_system_host_keys()
+    known_hosts_path = os.path.expanduser("~/.ssh/known_hosts")
+    if os.path.exists(known_hosts_path):
+        try:
+            client.load_host_keys(known_hosts_path)
+        except paramiko.SSHException:
+            pass
 
     if strict_host_key_checking:
-        ssh_cmd.extend(["-o", "StrictHostKeyChecking=yes"])
+        client.set_missing_host_key_policy(paramiko.RejectPolicy())
     else:
-        ssh_cmd.extend(["-o", "StrictHostKeyChecking=accept-new"])
+        client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
 
+    connect_kwargs: dict[str, Any] = {
+        "hostname": target_host,
+        "port": target_port,
+        "timeout": CONNECT_TIMEOUT_SEC,
+    }
+    if target_user:
+        connect_kwargs["username"] = target_user
+    if target_password:
+        # Explicit password: disable key lookup so the intent is unambiguous.
+        connect_kwargs["password"] = target_password
+        connect_kwargs["look_for_keys"] = False
+        connect_kwargs["allow_agent"] = False
     if identity_file.strip():
-        ssh_cmd.extend(["-i", identity_file.strip()])
-
-    ssh_cmd.extend([target, command])
+        connect_kwargs["key_filename"] = identity_file.strip()
 
     try:
-        completed = subprocess.run(
-            ssh_cmd,
-            capture_output=True,
-            text=True,
-            timeout=target_timeout,
-            check=False,
-        )
-    except FileNotFoundError as exc:
+        client.connect(**connect_kwargs)
+    except paramiko.AuthenticationException as exc:
         return {
             "ok": False,
-            "error": f"ssh binary not found: {exc}",
+            "error": f"Authentication failed: {exc}",
             "exit_code": None,
             "stdout": "",
             "stderr": "",
             "target": target,
             "command": command,
         }
-    except subprocess.TimeoutExpired as exc:
-        stdout = exc.stdout or ""
-        stderr = exc.stderr or ""
+    except paramiko.SSHException as exc:
+        return {
+            "ok": False,
+            "error": f"SSH error: {exc}",
+            "exit_code": None,
+            "stdout": "",
+            "stderr": "",
+            "target": target,
+            "command": command,
+        }
+    except (socket.timeout, TimeoutError):
+        return {
+            "ok": False,
+            "error": f"Connection timed out after {CONNECT_TIMEOUT_SEC} seconds",
+            "exit_code": None,
+            "stdout": "",
+            "stderr": "",
+            "target": target,
+            "command": command,
+        }
+    except OSError as exc:
+        return {
+            "ok": False,
+            "error": f"Connection error: {exc}",
+            "exit_code": None,
+            "stdout": "",
+            "stderr": "",
+            "target": target,
+            "command": command,
+        }
+
+    try:
+        _stdin, _stdout, _stderr = client.exec_command(command, timeout=target_timeout)
+
+        # Read stdout and stderr concurrently to avoid deadlocks when either
+        # stream produces enough output to fill the remote SSH buffer.
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            f_out = pool.submit(lambda: _stdout.read().decode(errors="replace"))
+            f_err = pool.submit(lambda: _stderr.read().decode(errors="replace"))
+            stdout_text = f_out.result()
+            stderr_text = f_err.result()
+
+        exit_code = _stdout.channel.recv_exit_status()
+    except socket.timeout:
         return {
             "ok": False,
             "error": f"Command timed out after {target_timeout} seconds",
             "exit_code": None,
-            "stdout": _truncate(stdout),
-            "stderr": _truncate(stderr),
+            "stdout": "",
+            "stderr": "",
             "target": target,
             "command": command,
-            "ssh_invocation": " ".join(shlex.quote(token) for token in ssh_cmd),
         }
+    except paramiko.SSHException as exc:
+        return {
+            "ok": False,
+            "error": f"SSH error during command execution: {exc}",
+            "exit_code": None,
+            "stdout": "",
+            "stderr": "",
+            "target": target,
+            "command": command,
+        }
+    finally:
+        client.close()
 
     return {
-        "ok": completed.returncode == 0,
-        "exit_code": completed.returncode,
-        "stdout": _truncate(completed.stdout),
-        "stderr": _truncate(completed.stderr),
+        "ok": exit_code == 0,
+        "exit_code": exit_code,
+        "stdout": _truncate(stdout_text),
+        "stderr": _truncate(stderr_text),
         "target": target,
         "command": command,
-        "ssh_invocation": " ".join(shlex.quote(token) for token in ssh_cmd),
     }
 
 
