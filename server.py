@@ -7,7 +7,7 @@ import os
 import re
 import socket
 from concurrent.futures import ThreadPoolExecutor
-from typing import Any
+from typing import Any, Literal, cast
 
 import paramiko
 from mcp.server.fastmcp import FastMCP
@@ -15,6 +15,31 @@ from mcp.server.fastmcp import FastMCP
 SERVER_NAME = "ssh-mcp"
 HOST_PATTERN = re.compile(r"^[A-Za-z0-9._-]+$")
 USER_PATTERN = re.compile(r"^[A-Za-z0-9._-]+$")
+SUPPORTED_TRANSPORTS = {"stdio", "streamable-http"}
+
+
+def _env_bool(name: str, default: bool = False) -> bool:
+    raw_value = os.getenv(name)
+    if raw_value is None:
+        return default
+
+    value = raw_value.strip().lower()
+    if value in {"1", "true", "yes", "on"}:
+        return True
+    if value in {"0", "false", "no", "off"}:
+        return False
+
+    raise ValueError(
+        f"Invalid boolean value for {name}: {raw_value!r}. Use one of: true/false, 1/0, yes/no, on/off."
+    )
+
+
+def _normalize_http_path(name: str, default: str) -> str:
+    value = os.getenv(name, default).strip() or default
+    if not value.startswith("/"):
+        raise ValueError(f"{name} must start with '/': {value!r}")
+    return value
+
 
 DEFAULT_HOST = os.getenv("SSH_DEFAULT_HOST", "").strip()
 DEFAULT_USER = os.getenv("SSH_DEFAULT_USER", "").strip()
@@ -26,8 +51,24 @@ MAX_OUTPUT_CHARS = int(os.getenv("SSH_MAX_OUTPUT_CHARS", "12000"))
 ALLOWED_HOSTS = {
     host.strip() for host in os.getenv("SSH_ALLOWED_HOSTS", "").split(",") if host.strip()
 }
+MCP_TRANSPORT = os.getenv("MCP_TRANSPORT", "stdio").strip().lower() or "stdio"
+MCP_HOST = os.getenv("MCP_HOST", "127.0.0.1").strip() or "127.0.0.1"
+MCP_PORT = int(os.getenv("MCP_PORT", "8000"))
+MCP_MOUNT_PATH = _normalize_http_path("MCP_MOUNT_PATH", "/")
+MCP_STREAMABLE_HTTP_PATH = _normalize_http_path("MCP_STREAMABLE_HTTP_PATH", "/mcp")
+MCP_STATELESS_HTTP = _env_bool("MCP_STATELESS_HTTP", default=False)
+if MCP_PORT <= 0 or MCP_PORT > 65535:
+    raise ValueError("MCP_PORT must be between 1 and 65535")
 
-mcp = FastMCP(SERVER_NAME, json_response=True)
+mcp = FastMCP(
+    SERVER_NAME,
+    host=MCP_HOST,
+    port=MCP_PORT,
+    mount_path=MCP_MOUNT_PATH,
+    streamable_http_path=MCP_STREAMABLE_HTTP_PATH,
+    stateless_http=MCP_STATELESS_HTTP,
+    json_response=True,
+)
 
 
 def _validate_host(host: str) -> None:
@@ -50,6 +91,15 @@ def _truncate(text: str) -> str:
         return text
     remainder = len(text) - MAX_OUTPUT_CHARS
     return text[:MAX_OUTPUT_CHARS] + f"\n... [truncated {remainder} characters]"
+
+
+def _validate_transport(transport: str) -> Literal["stdio", "streamable-http"]:
+    if transport not in SUPPORTED_TRANSPORTS:
+        supported = ", ".join(sorted(SUPPORTED_TRANSPORTS))
+        raise ValueError(
+            f"Unsupported MCP transport {transport!r}. Supported transports: {supported}"
+        )
+    return cast(Literal["stdio", "streamable-http"], transport)
 
 
 @mcp.tool()
@@ -212,4 +262,8 @@ def ssh_exec(
 
 
 if __name__ == "__main__":
-    mcp.run(transport="stdio")
+    transport = _validate_transport(MCP_TRANSPORT)
+    try:
+        mcp.run(transport=transport)
+    except KeyboardInterrupt:
+        pass

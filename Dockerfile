@@ -19,4 +19,6 @@ COPY server.py /app/server.py
 USER app
 ENV HOME=/home/app
 
+EXPOSE 8000
+
 CMD ["python", "/app/server.py"]
